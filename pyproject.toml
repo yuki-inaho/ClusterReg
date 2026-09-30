@@ -1,0 +1,65 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "clusterreg"
+version = "1.1.0"
+description = "Fast, theory-audited non-rigid point-set registration"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Mingyang Zhao et al.", email = "migyangz@gmail.com" },
+]
+dependencies = ["numpy>=1.23"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: C++",
+  "License :: OSI Approved :: GNU Affero General Public License v3",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "scipy>=1.10", "scikit-learn>=1.2"]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+cmake.args = [
+  "-DCLUSTERREG_BUILD_PYTHON=ON",
+  "-DCLUSTERREG_BUILD_CLI=OFF",
+  "-DCLUSTERREG_BUILD_TESTS=OFF",
+]
+wheel.packages = ["python/clusterreg"]
+sdist.include = [
+  "LICENSE",
+  "CMakeLists.txt",
+  "pixi.toml",
+  "pixi.lock",
+  "include/clusterreg/*.hpp",
+  "src/*.cpp",
+  "src/*.hpp",
+  "src/*.cu",
+  "python/bindings.cpp",
+  "python/clusterreg/*.py",
+  "tests/**/*.cpp",
+  "tests/**/*.py",
+  "tests/**/*.md",
+  "scripts/*.py",
+  "docs/*.md",
+  "NOTICE.md",
+]
+sdist.exclude = [
+  ".serena/**",
+  ".pixi/**",
+  ".pytest_cache/**",
+  "**/.pytest_cache/**",
+  "**/__pycache__/**",
+  "build/**",
+  "data/**",
+  "fig/**",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+addopts = "-ra"

@@ -1,0 +1,107 @@
+[workspace]
+name = "clusterreg"
+version = "1.1.0"
+description = "Fast nanobind implementation of ClusterReg"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.10,<3.14"
+numpy = ">=1.23"
+eigen = "3.4.*"
+nanobind = ">=2.4"
+scikit-build-core = ">=0.10"
+cmake = ">=3.18"
+ninja = ">=1.11"
+cxx-compiler = ">=1.7"
+pytest = ">=8"
+scipy = ">=1.10"
+scikit-learn = ">=1.2"
+matplotlib = ">=3.8"
+pip = ">=24"
+
+[feature.cuda.dependencies]
+cuda-version = "12.9.*"
+cuda-nvcc = "12.9.*"
+cuda-cudart-dev = "12.9.*"
+
+[environments]
+default = { features = [], solve-group = "default" }
+cuda = { features = ["cuda"], solve-group = "cuda" }
+
+[tasks.configure-cpp]
+cmd = "cmake -S . -B build/pixi -G Ninja -DCMAKE_BUILD_TYPE=Release -DCLUSTERREG_BUILD_PYTHON=OFF -DCLUSTERREG_CUDA=OFF"
+
+[tasks.build-cpp]
+cmd = "cmake --build build/pixi --parallel 2"
+depends-on = ["configure-cpp"]
+
+[tasks.test-cpp]
+cmd = "ctest --test-dir build/pixi --output-on-failure"
+depends-on = ["build-cpp"]
+
+[tasks.install-python]
+cmd = "CMAKE_ARGS='-DCLUSTERREG_CUDA=OFF' python -m pip install --no-build-isolation --no-deps --no-cache-dir --force-reinstall --editable ."
+
+[tasks.test-python]
+cmd = "python -m pytest tests/python -q"
+depends-on = ["install-python", "build-cpp"]
+
+[tasks.validate-theory]
+cmd = "OPENBLAS_NUM_THREADS=1 python scripts/validate.py --exe build/pixi/clusterreg_cli --output build/pixi/validation.json"
+depends-on = ["build-cpp"]
+
+[tasks.benchmark-smoke]
+cmd = "OPENBLAS_NUM_THREADS=1 python scripts/benchmark.py --exe build/pixi/clusterreg_cli --out-dir build/results/smoke --repeats 1 --max-n 512 --overwrite"
+depends-on = ["build-cpp"]
+
+[tasks.profile-sinkhorn-cpu]
+cmd = "python scripts/profile_sinkhorn.py --sizes 128 256 512 --outer-iterations 3 --sinkhorn-iterations 50 --repeats 3 --output build/results/sinkhorn_cpu.json"
+depends-on = ["install-python"]
+
+[tasks.profile-sinkhorn-student-cpu]
+cmd = "python scripts/profile_sinkhorn.py --sizes 128 256 512 --outer-iterations 3 --sinkhorn-iterations 50 --repeats 3 --student --output build/results/sinkhorn_student_cpu.json"
+depends-on = ["install-python"]
+
+[tasks.configure-sanitize]
+cmd = "cmake -S . -B build/pixi-sanitize -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCLUSTERREG_BUILD_PYTHON=OFF -DCLUSTERREG_OPENMP=OFF -DCLUSTERREG_SANITIZE=ON -DCLUSTERREG_CUDA=OFF"
+
+[tasks.build-sanitize]
+cmd = "cmake --build build/pixi-sanitize --parallel 2"
+depends-on = ["configure-sanitize"]
+
+[tasks.test-sanitize]
+cmd = "ctest --test-dir build/pixi-sanitize --output-on-failure"
+depends-on = ["build-sanitize"]
+
+[tasks.test]
+depends-on = ["test-cpp", "test-python", "validate-theory"]
+
+[feature.cuda.tasks.configure-cuda]
+cmd = "cmake -S . -B build/pixi-cuda-env -G Ninja -DCMAKE_BUILD_TYPE=Release -DCLUSTERREG_CUDA=ON -DCLUSTERREG_BUILD_PYTHON=OFF -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_COMPILER=nvcc"
+
+[feature.cuda.tasks.build-cuda]
+cmd = "cmake --build build/pixi-cuda-env --parallel 2"
+depends-on = ["configure-cuda"]
+
+[feature.cuda.tasks.test-cuda-cpp]
+cmd = "ctest --test-dir build/pixi-cuda-env --output-on-failure"
+depends-on = ["build-cuda"]
+
+[feature.cuda.tasks.install-python-cuda]
+cmd = "CMAKE_ARGS='-DCLUSTERREG_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_COMPILER=nvcc' python -m pip install --no-build-isolation --no-deps --no-cache-dir --force-reinstall --editable ."
+
+[feature.cuda.tasks.test-python-cuda]
+cmd = "python -m pytest tests/python -q"
+depends-on = ["install-python-cuda"]
+
+[feature.cuda.tasks.test-cuda]
+depends-on = ["test-cuda-cpp", "test-python-cuda"]
+
+[feature.cuda.tasks.profile-sinkhorn-cuda]
+cmd = "python scripts/profile_sinkhorn.py --sizes 128 256 512 1024 --outer-iterations 3 --sinkhorn-iterations 50 --repeats 3 --require-cuda --output build/results/sinkhorn_cuda.json"
+depends-on = ["install-python-cuda"]
+
+[feature.cuda.tasks.profile-sinkhorn-student-cuda]
+cmd = "python scripts/profile_sinkhorn.py --sizes 512 1024 --outer-iterations 3 --sinkhorn-iterations 50 --repeats 3 --student --require-cuda --output build/results/sinkhorn_student_cuda.json"
+depends-on = ["install-python-cuda"]
