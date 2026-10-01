@@ -30,7 +30,7 @@ default = { features = [], solve-group = "default" }
 cuda = { features = ["cuda"], solve-group = "cuda" }
 
 [tasks.configure-cpp]
-cmd = "cmake -S . -B build/pixi -G Ninja -DCMAKE_BUILD_TYPE=Release -DCLUSTERREG_BUILD_PYTHON=OFF -DCLUSTERREG_CUDA=OFF"
+cmd = "cmake -S . -B build/pixi -G Ninja -DCMAKE_BUILD_TYPE=Release -DCLUSTERREG_BUILD_PYTHON=OFF -DCLUSTERREG_CUDA=OFF -DCLUSTERREG_NATIVE=OFF -DCLUSTERREG_IPO=OFF"
 
 [tasks.build-cpp]
 cmd = "cmake --build build/pixi --parallel 2"
@@ -41,7 +41,7 @@ cmd = "ctest --test-dir build/pixi --output-on-failure"
 depends-on = ["build-cpp"]
 
 [tasks.install-python]
-cmd = "CMAKE_ARGS='-DCLUSTERREG_CUDA=OFF' python -m pip install --no-build-isolation --no-deps --no-cache-dir --force-reinstall --editable ."
+cmd = "CMAKE_ARGS='-DCLUSTERREG_CUDA=OFF -DCLUSTERREG_NATIVE=OFF -DCLUSTERREG_IPO=OFF' python -m pip install --no-build-isolation --no-deps --no-cache-dir --force-reinstall --editable ."
 
 [tasks.test-python]
 cmd = "python -m pytest tests/python -q"
@@ -77,8 +77,52 @@ depends-on = ["build-sanitize"]
 [tasks.test]
 depends-on = ["test-cpp", "test-python", "validate-theory"]
 
+[tasks.configure-native]
+cmd = "cmake -S . -B build/pixi-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DCLUSTERREG_BUILD_PYTHON=OFF -DCLUSTERREG_CUDA=OFF -DCLUSTERREG_NATIVE=ON -DCLUSTERREG_IPO=OFF"
+
+[tasks.build-native]
+cmd = "cmake --build build/pixi-native --parallel 2"
+depends-on = ["configure-native"]
+
+[tasks.test-native]
+cmd = "ctest --test-dir build/pixi-native --output-on-failure"
+depends-on = ["build-native"]
+
+[tasks.configure-fast]
+cmd = "cmake -S . -B build/pixi-fast -G Ninja -DCMAKE_BUILD_TYPE=Release -DCLUSTERREG_BUILD_PYTHON=OFF -DCLUSTERREG_CUDA=OFF -DCLUSTERREG_NATIVE=ON -DCLUSTERREG_IPO=ON"
+
+[tasks.build-fast]
+cmd = "cmake --build build/pixi-fast --parallel 2"
+depends-on = ["configure-fast"]
+
+[tasks.test-fast-cpp]
+cmd = "ctest --test-dir build/pixi-fast --output-on-failure"
+depends-on = ["build-fast"]
+
+[tasks.install-python-fast]
+cmd = "CMAKE_ARGS='-DCLUSTERREG_CUDA=OFF -DCLUSTERREG_NATIVE=ON -DCLUSTERREG_IPO=ON' python -m pip install --no-build-isolation --no-deps --no-cache-dir --force-reinstall --editable ."
+
+[tasks.test-python-fast]
+cmd = "python -m pytest tests/python -q"
+depends-on = ["install-python-fast"]
+
+[tasks.validate-theory-fast]
+cmd = "OPENBLAS_NUM_THREADS=1 python scripts/validate.py --exe build/pixi-fast/clusterreg_cli --output build/pixi-fast/validation.json"
+depends-on = ["build-fast"]
+
+[tasks.test-fast]
+depends-on = ["test-fast-cpp", "test-python-fast", "validate-theory-fast"]
+
+[tasks.profile-sinkhorn-fast]
+cmd = "python scripts/profile_sinkhorn.py --sizes 128 256 512 1024 --outer-iterations 3 --sinkhorn-iterations 50 --repeats 3 --output build/results/sinkhorn_fast.json"
+depends-on = ["install-python-fast"]
+
+[tasks.profile-sinkhorn-student-fast]
+cmd = "python scripts/profile_sinkhorn.py --sizes 512 1024 --outer-iterations 3 --sinkhorn-iterations 50 --repeats 3 --student --output build/results/sinkhorn_student_fast.json"
+depends-on = ["install-python-fast"]
+
 [feature.cuda.tasks.configure-cuda]
-cmd = "cmake -S . -B build/pixi-cuda-env -G Ninja -DCMAKE_BUILD_TYPE=Release -DCLUSTERREG_CUDA=ON -DCLUSTERREG_BUILD_PYTHON=OFF -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_COMPILER=nvcc"
+cmd = "NVCC_CCBIN=\"$CXX\" cmake -S . -B build/pixi-cuda-env -G Ninja -DCMAKE_BUILD_TYPE=Release -DCLUSTERREG_CUDA=ON -DCLUSTERREG_BUILD_PYTHON=OFF -DCLUSTERREG_NATIVE=OFF -DCLUSTERREG_IPO=OFF -DCLUSTERREG_CUDA_LINEINFO=OFF -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_COMPILER=nvcc -DCMAKE_CUDA_HOST_COMPILER=\"$CXX\""
 
 [feature.cuda.tasks.build-cuda]
 cmd = "cmake --build build/pixi-cuda-env --parallel 2"
@@ -89,7 +133,7 @@ cmd = "ctest --test-dir build/pixi-cuda-env --output-on-failure"
 depends-on = ["build-cuda"]
 
 [feature.cuda.tasks.install-python-cuda]
-cmd = "CMAKE_ARGS='-DCLUSTERREG_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_COMPILER=nvcc' python -m pip install --no-build-isolation --no-deps --no-cache-dir --force-reinstall --editable ."
+cmd = "NVCC_CCBIN=\"$CXX\" CMAKE_ARGS=\"-DCLUSTERREG_CUDA=ON -DCLUSTERREG_NATIVE=OFF -DCLUSTERREG_IPO=OFF -DCLUSTERREG_CUDA_LINEINFO=OFF -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_COMPILER=nvcc -DCMAKE_CUDA_HOST_COMPILER=$CXX\" python -m pip install --no-build-isolation --no-deps --no-cache-dir --force-reinstall --editable ."
 
 [feature.cuda.tasks.test-python-cuda]
 cmd = "python -m pytest tests/python -q"
@@ -105,3 +149,10 @@ depends-on = ["install-python-cuda"]
 [feature.cuda.tasks.profile-sinkhorn-student-cuda]
 cmd = "python scripts/profile_sinkhorn.py --sizes 512 1024 --outer-iterations 3 --sinkhorn-iterations 50 --repeats 3 --student --require-cuda --output build/results/sinkhorn_student_cuda.json"
 depends-on = ["install-python-cuda"]
+
+[feature.cuda.tasks.configure-cuda-fast]
+cmd = "NVCC_CCBIN=\"$CXX\" cmake -S . -B build/pixi-cuda-fast -G Ninja -DCMAKE_BUILD_TYPE=Release -DCLUSTERREG_CUDA=ON -DCLUSTERREG_BUILD_PYTHON=OFF -DCLUSTERREG_NATIVE=ON -DCLUSTERREG_IPO=OFF -DCLUSTERREG_CUDA_LINEINFO=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_COMPILER=nvcc -DCMAKE_CUDA_HOST_COMPILER=\"$CXX\""
+
+[feature.cuda.tasks.build-cuda-fast]
+cmd = "cmake --build build/pixi-cuda-fast --parallel 2"
+depends-on = ["configure-cuda-fast"]

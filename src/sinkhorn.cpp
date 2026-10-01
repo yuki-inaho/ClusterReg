@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -23,11 +24,14 @@ void require(bool condition, const std::string& message) {
     if (!condition) throw std::invalid_argument(message);
 }
 
-#ifdef _OPENMP
 int thread_count(int requested) {
+#ifdef _OPENMP
     return std::max(1, requested);
-}
+#else
+    (void)requested;
+    return 1;
 #endif
+}
 
 struct CostModel {
     NoiseModel noise;
@@ -66,31 +70,93 @@ struct CostModel {
     }
 };
 
-struct OnlineLogSumExp {
-    double maximum = -std::numeric_limits<double>::infinity();
-    double shifted_sum = 0;
-
-    void add(double value) {
-        if (value <= maximum) {
-            shifted_sum += std::exp(value - maximum);
-        } else {
-            shifted_sum = maximum == -std::numeric_limits<double>::infinity()
-                              ? 1.0
-                              : shifted_sum * std::exp(maximum - value) + 1.0;
-            maximum = value;
-        }
-    }
-
-    double value() const { return maximum + std::log(shifted_sum); }
+struct CpuScratch {
+    Vector distance, costs, values, weights, auxiliary;
+    explicit CpuScratch(Index count)
+        : distance(count), costs(count), values(count), weights(count), auxiliary(count) {}
 };
 
-double squared_distance(const Matrix& left, Index i, const Matrix& right, Index j) {
-    double value = 0;
-    for (Index axis = 0; axis < left.cols(); ++axis) {
-        const double delta = left(i, axis) - right(j, axis);
-        value += delta * delta;
+struct TransportWorker : CpuScratch {
+    Vector target_mass, target_max, target_sum;
+    long double gamma_mass = 0, omega_mass = 0, omega_sse = 0, omega_x2 = 0;
+    long double cost_term = 0, plan_kl_core = 0;
+    TransportWorker(Index count, Index target_count)
+        : CpuScratch(count), target_mass(Vector::Zero(target_count)),
+          target_max(Vector::Constant(target_count,
+              -std::numeric_limits<double>::infinity())),
+          target_sum(Vector::Zero(target_count)) {}
+};
+
+void distance_vector(const Matrix& points, const Matrix& fixed, Index row,
+                     CpuScratch& scratch) {
+    const Index count = points.rows();
+    scratch.distance.head(count).setZero();
+    // Direct differences preserve stability for a large common offset. Each
+    // coordinate column is contiguous, allowing Eigen's double packets.
+    for (Index axis = 0; axis < points.cols(); ++axis)
+        scratch.distance.head(count).array() +=
+            (points.col(axis).array() - fixed(row, axis)).square();
+}
+
+template<NoiseModel Model>
+void cost_vector(const CostModel& cost, Index count, CpuScratch& scratch) {
+    if constexpr (Model == NoiseModel::Gaussian) {
+        scratch.costs.head(count).array() = cost.normalizer +
+            scratch.distance.head(count).array() / (2.0 * cost.scale);
+    } else {
+        scratch.values.head(count).array() = scratch.distance.head(count).array() /
+            (cost.student_dof * cost.scale);
+        scratch.auxiliary.head(count).array() = 1.0 + scratch.values.head(count).array();
+        // Kahan's log1p formula also used by Eigen's generic_plog1p. A safe
+        // denominator prevents 0/0 before the small-argument scalar correction.
+        scratch.weights.head(count).array() =
+            (scratch.auxiliary.head(count).array() == 1.0).select(
+                1.0, scratch.auxiliary.head(count).array() - 1.0);
+        scratch.costs.head(count).array() = cost.normalizer + cost.student_factor *
+            (scratch.values.head(count).array() *
+             (scratch.auxiliary.head(count).array().log() /
+              scratch.weights.head(count).array()));
+        for (Index j = 0; j < count; ++j) {
+            const double x = scratch.values[j];
+            if (x < 1e-4 || !std::isfinite(x))
+                scratch.costs[j] = cost.normalizer + cost.student_factor * std::log1p(x);
+        }
     }
-    return value;
+}
+
+// Eigen packet exp clamps its negative tail; restore scalar libm there. The
+// plan path retains its existing explicit cutoff, while LSE keeps subnormals.
+void vector_exp(const Vector& values, Index count, Vector& output, bool plan) {
+    output.head(count).array() = values.head(count).array().max(-700.0).exp();
+    for (Index j = 0; j < count; ++j)
+        if (values[j] < -700.0)
+            output[j] = plan && values[j] < -745.0 ? 0.0 : std::exp(values[j]);
+}
+
+double logsumexp(Index count, CpuScratch& scratch, int& invalid) {
+    const double maximum = scratch.values.head(count).maxCoeff();
+    if (!std::isfinite(maximum)) {
+        invalid = 1;
+        return 0.0;
+    }
+    scratch.auxiliary.head(count).array() = scratch.values.head(count).array() - maximum;
+    vector_exp(scratch.auxiliary, count, scratch.weights, false);
+    const double sum = scratch.weights.head(count).sum();
+    if (!(sum > 0.0) || !std::isfinite(sum)) {
+        invalid = 1;
+        return 0.0;
+    }
+    return maximum + std::log(sum);
+}
+
+void add_log_value(double value, double& maximum, double& shifted_sum) {
+    if (value == -std::numeric_limits<double>::infinity()) return;
+    if (value <= maximum) shifted_sum += std::exp(value - maximum);
+    else {
+        shifted_sum = shifted_sum == 0.0
+            ? 1.0 : shifted_sum * std::exp(maximum - value) + 1.0;
+        maximum = value;
+    }
 }
 
 double generalized_kl(const Vector& value, double log_reference) {
@@ -101,12 +167,6 @@ double generalized_kl(const Vector& value, double log_reference) {
                              (std::log(x) - log_reference) - x;
     }
     return static_cast<double>(result);
-}
-
-double safe_exp(double value) {
-    if (value > 700.0) throw std::runtime_error("Sinkhorn plan overflow; rescale input or increase eta");
-    if (value < -745.0) return 0.0;
-    return std::exp(value);
 }
 
 void common_prepare(Result& result, const Matrix& source, const Matrix& target,
@@ -181,7 +241,8 @@ double fixed_cost(const Matrix& target, const Matrix& e_transformed, double e_sc
 }
 } // namespace
 
-TransportOutput sinkhorn_transport_cpu(const Matrix& target, const Matrix& transformed,
+template<NoiseModel Model>
+TransportOutput transport_cpu_impl(const Matrix& target, const Matrix& transformed,
                                        double scale, const Options& options,
                                        const Vector& initial_log_u,
                                        const Vector& initial_log_v) {
@@ -191,16 +252,18 @@ TransportOutput sinkhorn_transport_cpu(const Matrix& target, const Matrix& trans
     const double log_b = -std::log(static_cast<double>(source_count));
     const double log_a = -std::log(static_cast<double>(target_count));
     const double log_ba = log_b + log_a;
-    const double theta_y = options.source_mass_penalty /
-                           (options.source_mass_penalty + options.transport_entropy);
-    const double theta_x = options.target_mass_penalty /
-                           (options.target_mass_penalty + options.transport_entropy);
+    const double theta_y = marginal_exponent(options.source_mass_penalty,
+                                             options.transport_entropy);
+    const double theta_x = marginal_exponent(options.target_mass_penalty,
+                                             options.transport_entropy);
     const double contraction = theta_y * theta_x;
     const CostModel cost(dimension, scale, options);
-#ifdef _OPENMP
     const int threads = std::min<int>(thread_count(options.threads),
                                       static_cast<int>(std::max(source_count, target_count)));
-#endif
+    std::vector<TransportWorker> workers;
+    workers.reserve(static_cast<std::size_t>(threads));
+    for (int id = 0; id < threads; ++id)
+        workers.emplace_back(std::max(source_count, target_count), target_count);
 
     Vector log_u = initial_log_u.size() == source_count
                        ? initial_log_u
@@ -211,40 +274,56 @@ TransportOutput sinkhorn_transport_cpu(const Matrix& target, const Matrix& trans
     Vector next_u(source_count), next_v(target_count);
     double residual = std::numeric_limits<double>::infinity();
     int used_iterations = 0;
-    for (int iteration = 0; iteration < options.sinkhorn_iterations; ++iteration) {
+    int invalid = 0;
+    bool finished = false;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(threads)
+#pragma omp parallel num_threads(threads)
 #endif
-        for (Index i = 0; i < source_count; ++i) {
-            OnlineLogSumExp lse;
-            for (Index j = 0; j < target_count; ++j) {
-                const double value = log_ba -
-                    cost(squared_distance(transformed, i, target, j)) /
-                        options.transport_entropy + log_v[j];
-                lse.add(value);
-            }
-            next_u[i] = theta_y * (log_b - lse.value());
-        }
+    {
+        int id = 0;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(threads)
+        id = omp_get_thread_num();
 #endif
-        for (Index j = 0; j < target_count; ++j) {
-            OnlineLogSumExp lse;
+        auto& scratch = workers[static_cast<std::size_t>(id)];
+        // Reuse one OpenMP team and its scratch through all dual sweeps.
+        for (int iteration = 0; iteration < options.sinkhorn_iterations; ++iteration) {
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:invalid)
+#endif
             for (Index i = 0; i < source_count; ++i) {
-                const double value = log_ba -
-                    cost(squared_distance(transformed, i, target, j)) /
-                        options.transport_entropy + next_u[i];
-                lse.add(value);
+                distance_vector(target, transformed, i, scratch);
+                cost_vector<Model>(cost, target_count, scratch);
+                scratch.values.head(target_count) =
+                    (log_ba - scratch.costs.head(target_count).array() /
+                     options.transport_entropy + log_v.array()).matrix();
+                next_u[i] = theta_y * (log_b - logsumexp(target_count, scratch, invalid));
             }
-            next_v[j] = theta_x * (log_a - lse.value());
+#ifdef _OPENMP
+#pragma omp for schedule(static) reduction(|:invalid)
+#endif
+            for (Index j = 0; j < target_count; ++j) {
+                distance_vector(transformed, target, j, scratch);
+                cost_vector<Model>(cost, source_count, scratch);
+                scratch.values.head(source_count) =
+                    (log_ba - scratch.costs.head(source_count).array() /
+                     options.transport_entropy + next_u.array()).matrix();
+                next_v[j] = theta_x * (log_a - logsumexp(source_count, scratch, invalid));
+            }
+#ifdef _OPENMP
+#pragma omp single
+#endif
+            {
+                const double change = (next_v - log_v).cwiseAbs().maxCoeff();
+                residual = change / (1.0 - contraction);
+                log_u.swap(next_u);
+                log_v.swap(next_v);
+                used_iterations = iteration + 1;
+                finished = invalid || residual <= options.sinkhorn_tolerance;
+            }
+            if (finished) break;
         }
-        const double change = (next_v - log_v).cwiseAbs().maxCoeff();
-        residual = change / (1.0 - contraction);
-        log_u.swap(next_u);
-        log_v.swap(next_v);
-        used_iterations = iteration + 1;
-        if (residual <= options.sinkhorn_tolerance) break;
     }
+    if (invalid) throw std::runtime_error("Nonfinite Sinkhorn log probabilities; rescale input");
 
     TransportOutput output;
     output.log_u = log_u;
@@ -256,44 +335,80 @@ TransportOutput sinkhorn_transport_cpu(const Matrix& target, const Matrix& trans
     output.dual_residual = residual;
     output.iterations = used_iterations;
     Vector log_p(source_count);
-    Vector q_max = Vector::Constant(target_count,
-        -std::numeric_limits<double>::infinity());
+    const Vector target_squared_norm = target.rowwise().squaredNorm();
+#ifdef _OPENMP
+#pragma omp parallel num_threads(threads) reduction(|:invalid)
+#endif
+    {
+        int id = 0;
+#ifdef _OPENMP
+        id = omp_get_thread_num();
+#endif
+        auto& worker = workers[static_cast<std::size_t>(id)];
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (Index i = 0; i < source_count; ++i) {
+            distance_vector(target, transformed, i, worker);
+            cost_vector<Model>(cost, target_count, worker);
+            worker.values.head(target_count) =
+                (log_u[i] + log_ba - worker.costs.head(target_count).array() /
+                 options.transport_entropy + log_v.array()).matrix();
+            log_p[i] = logsumexp(target_count, worker, invalid);
+            if (worker.values.head(target_count).maxCoeff() > 700.0) {
+                invalid = 1;
+                continue;
+            }
+            vector_exp(worker.values, target_count, worker.weights, true);
+            if constexpr (Model == NoiseModel::Gaussian)
+                worker.auxiliary.head(target_count) = worker.weights.head(target_count);
+            else
+                worker.auxiliary.head(target_count).array() =
+                    worker.weights.head(target_count).array() *
+                    ((cost.student_dof + static_cast<double>(dimension)) /
+                     (cost.student_dof + worker.distance.head(target_count).array() / scale));
+            output.gamma_source_mass[i] = worker.weights.head(target_count).sum();
+            output.omega.mass[i] = worker.auxiliary.head(target_count).sum();
+            worker.target_mass += worker.weights.head(target_count);
+            for (Index axis = 0; axis < dimension; ++axis)
+                output.omega.px(i, axis) =
+                    worker.auxiliary.head(target_count).dot(target.col(axis));
+            for (Index j = 0; j < target_count; ++j) {
+                const double gamma = worker.weights[j], omega = worker.auxiliary[j];
+                add_log_value(worker.values[j], worker.target_max[j], worker.target_sum[j]);
+                worker.gamma_mass += gamma;
+                worker.omega_mass += omega;
+                worker.omega_sse += static_cast<long double>(omega) * worker.distance[j];
+                worker.omega_x2 += static_cast<long double>(omega) * target_squared_norm[j];
+                worker.cost_term += static_cast<long double>(gamma) * worker.costs[j];
+                if (gamma > 0)
+                    worker.plan_kl_core += static_cast<long double>(gamma) *
+                                           (worker.values[j] - log_ba);
+            }
+        }
+    }
+    if (invalid) throw std::runtime_error("Sinkhorn plan overflow or invalid log probabilities; rescale input or increase eta");
+    Vector q_max = Vector::Constant(target_count, -std::numeric_limits<double>::infinity());
     Vector q_sum = Vector::Zero(target_count);
-
     long double gamma_mass = 0, omega_mass = 0, omega_sse = 0, omega_x2 = 0;
     long double cost_term = 0, plan_kl_core = 0;
-    for (Index i = 0; i < source_count; ++i) {
-        OnlineLogSumExp row_lse;
+    // Ordered worker reduction; target log marginals remain valid when their
+    // representable plan mass is zero, so KKT diagnostics do not take log(0).
+    for (const auto& worker : workers) {
+        output.gamma_target_mass += worker.target_mass;
+        gamma_mass += worker.gamma_mass;
+        omega_mass += worker.omega_mass;
+        omega_sse += worker.omega_sse;
+        omega_x2 += worker.omega_x2;
+        cost_term += worker.cost_term;
+        plan_kl_core += worker.plan_kl_core;
         for (Index j = 0; j < target_count; ++j) {
-            const double distance = squared_distance(transformed, i, target, j);
-            const double pair_cost = cost(distance);
-            const double log_gamma = log_u[i] + log_ba -
-                pair_cost / options.transport_entropy + log_v[j];
-            row_lse.add(log_gamma);
-            if (log_gamma <= q_max[j]) {
-                q_sum[j] += std::exp(log_gamma - q_max[j]);
-            } else {
-                q_sum[j] = q_max[j] == -std::numeric_limits<double>::infinity()
-                               ? 1.0
-                               : q_sum[j] * std::exp(q_max[j] - log_gamma) + 1.0;
-                q_max[j] = log_gamma;
-            }
-            const double gamma = safe_exp(log_gamma);
-            const double omega = gamma * cost.robust_weight(distance, dimension);
-            output.gamma_source_mass[i] += gamma;
-            output.gamma_target_mass[j] += gamma;
-            output.omega.mass[i] += omega;
-            for (Index axis = 0; axis < dimension; ++axis)
-                output.omega.px(i, axis) += omega * target(j, axis);
-            gamma_mass += gamma;
-            omega_mass += omega;
-            omega_sse += static_cast<long double>(omega) * distance;
-            omega_x2 += static_cast<long double>(omega) * target.row(j).squaredNorm();
-            cost_term += static_cast<long double>(gamma) * pair_cost;
-            if (gamma > 0)
-                plan_kl_core += static_cast<long double>(gamma) * (log_gamma - log_ba);
+            if (worker.target_sum[j] == 0.0) continue;
+            const double maximum = std::max(q_max[j], worker.target_max[j]);
+            q_sum[j] = q_sum[j] * std::exp(q_max[j] - maximum) +
+                worker.target_sum[j] * std::exp(worker.target_max[j] - maximum);
+            q_max[j] = maximum;
         }
-        log_p[i] = row_lse.value();
     }
     Vector log_q = q_max + q_sum.array().log().matrix();
     output.gamma_mass = static_cast<double>(gamma_mass);
@@ -309,20 +424,29 @@ TransportOutput sinkhorn_transport_cpu(const Matrix& target, const Matrix& trans
         options.source_mass_penalty * output.source_kl +
         options.target_mass_penalty * output.target_kl;
 
-    double kkt = 0;
-    for (Index i = 0; i < source_count; ++i) {
-        for (Index j = 0; j < target_count; ++j) {
-            const double value = options.transport_entropy * (log_u[i] + log_v[j]) +
-                options.source_mass_penalty * (log_p[i] - log_b) +
-                options.target_mass_penalty * (log_q[j] - log_a);
-            kkt = std::max(kkt, std::abs(value));
-        }
-    }
-    output.kkt_residual = kkt;
+    const Vector row_stationarity = options.transport_entropy * log_u.array() +
+        options.source_mass_penalty * (log_p.array() - log_b);
+    const Vector column_stationarity = options.transport_entropy * log_v.array() +
+        options.target_mass_penalty * (log_q.array() - log_a);
+    output.kkt_residual = std::max(
+        std::abs(row_stationarity.minCoeff() + column_stationarity.minCoeff()),
+        std::abs(row_stationarity.maxCoeff() + column_stationarity.maxCoeff()));
     return output;
 }
 
-double fixed_plan_cost_cpu(const Matrix& target, const Matrix& e_transformed,
+TransportOutput sinkhorn_transport_cpu(const Matrix& target, const Matrix& transformed,
+                                       double scale, const Options& options,
+                                       const Vector& initial_log_u,
+                                       const Vector& initial_log_v) {
+    if (options.noise_model == NoiseModel::Gaussian)
+        return transport_cpu_impl<NoiseModel::Gaussian>(target, transformed, scale,
+            options, initial_log_u, initial_log_v);
+    return transport_cpu_impl<NoiseModel::StudentT>(target, transformed, scale,
+        options, initial_log_u, initial_log_v);
+}
+
+template<NoiseModel Model>
+double fixed_cost_cpu_impl(const Matrix& target, const Matrix& e_transformed,
                            double e_scale, const Vector& log_u,
                            const Vector& log_v, const Matrix& candidate_transformed,
                            double candidate_scale, const Options& options) {
@@ -333,20 +457,70 @@ double fixed_plan_cost_cpu(const Matrix& target, const Matrix& e_transformed,
                           std::log(static_cast<double>(target_count));
     const CostModel old_cost(dimension, e_scale, options);
     const CostModel candidate_cost(dimension, candidate_scale, options);
-    long double value = 0;
-    for (Index i = 0; i < source_count; ++i) {
-        for (Index j = 0; j < target_count; ++j) {
-            const double old_distance = squared_distance(e_transformed, i, target, j);
-            const double log_gamma = log_u[i] + log_ba -
-                old_cost(old_distance) / options.transport_entropy + log_v[j];
-            const double gamma = safe_exp(log_gamma);
-            if (gamma > 0) {
-                const double new_distance = squared_distance(candidate_transformed, i, target, j);
-                value += static_cast<long double>(gamma) * candidate_cost(new_distance);
+    const int threads = std::min<int>(thread_count(options.threads), static_cast<int>(source_count));
+    std::vector<CpuScratch> workers;
+    std::vector<Vector> plans;
+    workers.reserve(static_cast<std::size_t>(threads));
+    plans.reserve(static_cast<std::size_t>(threads));
+    for (int id = 0; id < threads; ++id) {
+        workers.emplace_back(target_count);
+        plans.emplace_back(target_count);
+    }
+    std::vector<long double> partial(static_cast<std::size_t>(threads), 0.0L);
+    int invalid = 0;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(threads) reduction(|:invalid)
+#endif
+    {
+        int id = 0;
+#ifdef _OPENMP
+        id = omp_get_thread_num();
+#endif
+        auto& scratch = workers[static_cast<std::size_t>(id)];
+        auto& gamma = plans[static_cast<std::size_t>(id)];
+        long double& value = partial[static_cast<std::size_t>(id)];
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (Index i = 0; i < source_count; ++i) {
+            distance_vector(target, e_transformed, i, scratch);
+            cost_vector<Model>(old_cost, target_count, scratch);
+            scratch.values.head(target_count) =
+                (log_u[i] + log_ba - scratch.costs.head(target_count).array() /
+                 options.transport_entropy + log_v.array()).matrix();
+            if (scratch.values.head(target_count).maxCoeff() > 700.0) {
+                invalid = 1;
+                continue;
             }
+            vector_exp(scratch.values, target_count, scratch.weights, true);
+            if (!scratch.weights.head(target_count).allFinite()) {
+                invalid = 1;
+                continue;
+            }
+            // Save old-plan weights before Student-t cost uses scratch.weights.
+            gamma = scratch.weights.head(target_count);
+            distance_vector(target, candidate_transformed, i, scratch);
+            cost_vector<Model>(candidate_cost, target_count, scratch);
+            for (Index j = 0; j < target_count; ++j)
+                if (gamma[j] > 0)
+                    value += static_cast<long double>(gamma[j]) * scratch.costs[j];
         }
     }
+    if (invalid) throw std::runtime_error("Sinkhorn plan overflow; rescale input or increase eta");
+    long double value = 0;
+    for (long double item : partial) value += item;
     return static_cast<double>(value);
+}
+
+double fixed_plan_cost_cpu(const Matrix& target, const Matrix& e_transformed,
+                           double e_scale, const Vector& log_u, const Vector& log_v,
+                           const Matrix& candidate_transformed, double candidate_scale,
+                           const Options& options) {
+    if (options.noise_model == NoiseModel::Gaussian)
+        return fixed_cost_cpu_impl<NoiseModel::Gaussian>(target, e_transformed,
+            e_scale, log_u, log_v, candidate_transformed, candidate_scale, options);
+    return fixed_cost_cpu_impl<NoiseModel::StudentT>(target, e_transformed,
+        e_scale, log_u, log_v, candidate_transformed, candidate_scale, options);
 }
 
 Result fit_sinkhorn(const Matrix& source, const Matrix& target, const Options& options) {
@@ -360,6 +534,12 @@ Result fit_sinkhorn(const Matrix& source, const Matrix& target, const Options& o
     require(options.source_mass_penalty > 0 && std::isfinite(options.source_mass_penalty) &&
                 options.target_mass_penalty > 0 && std::isfinite(options.target_mass_penalty),
             "Sinkhorn marginal penalties must be finite and positive");
+    const double theta_y = marginal_exponent(options.source_mass_penalty,
+                                             options.transport_entropy);
+    const double theta_x = marginal_exponent(options.target_mass_penalty,
+                                             options.transport_entropy);
+    require(theta_y > 0.0 && theta_y < 1.0 && theta_x > 0.0 && theta_x < 1.0,
+            "Ill-conditioned Sinkhorn theta/contraction rounds to zero or one");
     require(options.regularization > 0 && std::isfinite(options.regularization),
             "regularization must be finite and positive");
     require(options.gamma > 0 && std::isfinite(options.gamma) &&
@@ -450,9 +630,11 @@ Result fit_sinkhorn(const Matrix& source, const Matrix& target, const Options& o
             residual_sum / (static_cast<double>(dimension) * transport.gamma_mass),
             options.sigma_floor, options.sigma_ceiling);
         record.solve_seconds = elapsed(solve_start);
-        const double candidate_cost = fixed_cost(
-            x, transformed, scale, transport.log_u, transport.log_v,
-            update.transformed, candidate_scale, options, backend);
+        const double candidate_cost = options.noise_model == NoiseModel::Gaussian
+            ? transport.gamma_mass * CostModel(dimension, candidate_scale, options).normalizer +
+                  residual_sum / (2.0 * candidate_scale)
+            : fixed_cost(x, transformed, scale, transport.log_u, transport.log_v,
+                         update.transformed, candidate_scale, options, backend);
         record.objective_after = candidate_cost +
             options.transport_entropy * transport.plan_kl +
             options.source_mass_penalty * transport.source_kl +

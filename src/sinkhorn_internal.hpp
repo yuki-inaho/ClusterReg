@@ -4,6 +4,14 @@
 
 namespace clusterreg::detail {
 
+// Avoid overflow in tau + eta and preserve the representable contraction.
+// Callers validate positive, finite inputs and reject exponents rounded to 0/1.
+inline double marginal_exponent(double penalty, double entropy) noexcept {
+    if (penalty >= entropy) return 1.0 / (1.0 + entropy / penalty);
+    const double ratio = penalty / entropy;
+    return ratio / (1.0 + ratio);
+}
+
 struct TransportOutput {
     Statistics omega;
     Vector gamma_source_mass;

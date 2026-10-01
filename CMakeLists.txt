@@ -10,12 +10,38 @@ endif()
 
 option(CLUSTERREG_OPENMP "Parallelize the exact expectation step" ON)
 option(CLUSTERREG_NATIVE "Optimize for the build machine" OFF)
+option(CLUSTERREG_IPO "Enable checked interprocedural optimization for CPU targets" OFF)
 option(CLUSTERREG_BLAS "Use an externally installed BLAS" OFF)
 option(CLUSTERREG_SANITIZE "Enable address and undefined-behavior sanitizers" OFF)
 option(CLUSTERREG_BUILD_CLI "Build the command-line application" ON)
 option(CLUSTERREG_BUILD_TESTS "Build the C++ test suite" ON)
 option(CLUSTERREG_BUILD_PYTHON "Build the nanobind Python module" OFF)
 option(CLUSTERREG_CUDA "Build the optional CUDA Sinkhorn backend" OFF)
+option(CLUSTERREG_CUDA_LINEINFO "Include CUDA source line information for profiling" OFF)
+
+if(CLUSTERREG_NATIVE AND NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  message(FATAL_ERROR "CLUSTERREG_NATIVE requires a GNU or Clang C++ compiler")
+endif()
+if(CLUSTERREG_IPO)
+  if(CLUSTERREG_CUDA)
+    message(FATAL_ERROR "CLUSTERREG_IPO is supported for CPU-only builds; disable IPO for CUDA")
+  endif()
+  include(CheckIPOSupported)
+  if(POLICY CMP0138)
+    cmake_policy(SET CMP0138 NEW)
+  endif()
+  check_ipo_supported(RESULT CLUSTERREG_IPO_SUPPORTED
+                      OUTPUT CLUSTERREG_IPO_ERROR LANGUAGES CXX)
+  if(NOT CLUSTERREG_IPO_SUPPORTED)
+    message(FATAL_ERROR "CLUSTERREG_IPO was requested but is unsupported: ${CLUSTERREG_IPO_ERROR}")
+  endif()
+endif()
+
+function(clusterreg_enable_ipo target_name)
+  if(CLUSTERREG_IPO)
+    set_property(TARGET ${target_name} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+  endif()
+endfunction()
 
 set(CLUSTERREG_SOURCES
   src/clusterreg.cpp
@@ -50,6 +76,7 @@ endif()
 add_library(clusterreg STATIC ${CLUSTERREG_SOURCES})
 add_library(clusterreg::clusterreg ALIAS clusterreg)
 set_target_properties(clusterreg PROPERTIES POSITION_INDEPENDENT_CODE ON)
+clusterreg_enable_ipo(clusterreg)
 target_include_directories(clusterreg PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
@@ -63,6 +90,11 @@ if(CLUSTERREG_CUDA)
   set_target_properties(clusterreg PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
   target_compile_definitions(clusterreg PUBLIC CLUSTERREG_HAS_CUDA=1)
   target_link_libraries(clusterreg PUBLIC CUDA::cudart)
+  if(CLUSTERREG_CUDA_LINEINFO)
+    target_compile_options(clusterreg PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info>
+    )
+  endif()
 endif()
 
 if(CLUSTERREG_OPENMP)
@@ -86,6 +118,7 @@ else()
   if(CLUSTERREG_NATIVE)
     target_compile_options(clusterreg PUBLIC
       $<$<COMPILE_LANGUAGE:CXX>:-march=native>
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-march=native>
     )
   endif()
   if(CLUSTERREG_SANITIZE)
@@ -99,12 +132,14 @@ endif()
 if(CLUSTERREG_BUILD_CLI)
   add_executable(clusterreg_cli src/main.cpp)
   target_link_libraries(clusterreg_cli PRIVATE clusterreg::clusterreg)
+  clusterreg_enable_ipo(clusterreg_cli)
 endif()
 
 if(CLUSTERREG_BUILD_TESTS)
   enable_testing()
   add_executable(clusterreg_tests tests/test_core.cpp)
   target_link_libraries(clusterreg_tests PRIVATE clusterreg::clusterreg)
+  clusterreg_enable_ipo(clusterreg_tests)
   add_test(NAME mathematical_and_edge_cases COMMAND clusterreg_tests)
 endif()
 
@@ -114,6 +149,7 @@ if(CLUSTERREG_BUILD_PYTHON)
   nanobind_add_module(_core python/bindings.cpp)
   target_link_libraries(_core PRIVATE clusterreg::clusterreg)
   target_compile_definitions(_core PRIVATE CLUSTERREG_VERSION="${PROJECT_VERSION}")
+  clusterreg_enable_ipo(_core)
   install(TARGETS _core LIBRARY DESTINATION clusterreg)
 endif()
 

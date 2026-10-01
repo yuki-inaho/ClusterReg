@@ -20,6 +20,10 @@ namespace {
 
 constexpr int kBlockSize = 256;
 constexpr int kMaximumGridSize = 65535;
+constexpr int kWarpSize = 32;
+constexpr unsigned int kFullWarpMask = 0xffffffffU;
+static_assert(kBlockSize % kWarpSize == 0,
+              "Block reductions require whole, active warps");
 
 [[noreturn]] void throw_cuda_error(cudaError_t error, const char* operation) {
     std::ostringstream message;
@@ -174,30 +178,79 @@ double generalized_kl(const Vector& value, double log_reference) {
 }
 
 __device__ double block_max(double value, double* scratch) {
-    const int thread = threadIdx.x;
-    scratch[thread] = value;
+    const int lane = threadIdx.x % kWarpSize;
+    const int warp = threadIdx.x / kWarpSize;
+    // Every caller launches exactly kBlockSize threads and all threads reach
+    // each reduction, including threads with no point-pair work.
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+        value = fmax(value, __shfl_down_sync(kFullWarpMask, value, offset));
+    if (lane == 0) scratch[warp] = value;
     __syncthreads();
-    for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
-        if (thread < offset)
-            scratch[thread] = fmax(scratch[thread], scratch[thread + offset]);
-        __syncthreads();
+    if (warp == 0) {
+        value = lane < kBlockSize / kWarpSize ? scratch[lane] : -CUDART_INF;
+        for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+            value = fmax(value, __shfl_down_sync(kFullWarpMask, value, offset));
+        if (lane == 0) scratch[0] = value;
     }
+    __syncthreads();
+    const double result = scratch[0];
+    // A following reduction reuses scratch.  Complete the broadcast reads
+    // before any warp writes its next partial result.
+    __syncthreads();
+    return result;
+}
+
+__device__ double block_min(double value, double* scratch) {
+    return -block_max(-value, scratch);
+}
+
+__device__ double block_sum(double value, double* scratch) {
+    const int lane = threadIdx.x % kWarpSize;
+    const int warp = threadIdx.x / kWarpSize;
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+        value += __shfl_down_sync(kFullWarpMask, value, offset);
+    if (lane == 0) scratch[warp] = value;
+    __syncthreads();
+    if (warp == 0) {
+        value = lane < kBlockSize / kWarpSize ? scratch[lane] : 0.0;
+        for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+            value += __shfl_down_sync(kFullWarpMask, value, offset);
+        if (lane == 0) scratch[0] = value;
+    }
+    __syncthreads();
     const double result = scratch[0];
     __syncthreads();
     return result;
 }
 
-__device__ double block_sum(double value, double* scratch) {
-    const int thread = threadIdx.x;
-    scratch[thread] = value;
-    __syncthreads();
-    for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
-        if (thread < offset) scratch[thread] += scratch[thread + offset];
-        __syncthreads();
+struct OnlineLogSumExp {
+    double maximum;
+    double sum;
+
+    __device__ void add(double value) {
+        if (value == -CUDART_INF) return;
+        if (sum == 0.0) {
+            maximum = value;
+            sum = 1.0;
+        } else if (value <= maximum) {
+            sum += exp(value - maximum);
+        } else {
+            sum = sum * exp(maximum - value) + 1.0;
+            maximum = value;
+        }
     }
-    const double result = scratch[0];
-    __syncthreads();
-    return result;
+};
+
+__device__ double block_log_sum_exp(const OnlineLogSumExp& local,
+                                     double* scratch) {
+    const double maximum = block_max(local.maximum, scratch);
+    // Empty threads are the (-inf, 0) identity.  Do not evaluate inf-inf
+    // when all entries underflow in log space or a thread has no work.
+    const double contribution = local.sum == 0.0
+                                    ? 0.0
+                                    : local.sum * exp(local.maximum - maximum);
+    const double sum = block_sum(contribution, scratch);
+    return maximum + log(sum);
 }
 
 __device__ double squared_distance(const double* left, std::int64_t left_count,
@@ -245,28 +298,18 @@ __global__ void update_source_dual_kernel(
     double theta_y, const double* log_v, double* next_u) {
     __shared__ double scratch[kBlockSize];
     for (std::int64_t i = blockIdx.x; i < source_count; i += gridDim.x) {
-        double local_maximum = -CUDART_INF;
+        OnlineLogSumExp local{-CUDART_INF, 0.0};
         for (std::int64_t j = threadIdx.x; j < target_count; j += blockDim.x) {
             const double distance = squared_distance(
                 transformed, source_count, i, target, target_count, j,
                 cost.dimension);
             const double value =
                 log_ba - pair_cost(distance, cost) / eta + log_v[j];
-            local_maximum = fmax(local_maximum, value);
+            local.add(value);
         }
-        const double maximum = block_max(local_maximum, scratch);
-        double local_sum = 0.0;
-        for (std::int64_t j = threadIdx.x; j < target_count; j += blockDim.x) {
-            const double distance = squared_distance(
-                transformed, source_count, i, target, target_count, j,
-                cost.dimension);
-            const double value =
-                log_ba - pair_cost(distance, cost) / eta + log_v[j];
-            local_sum += exp(value - maximum);
-        }
-        const double sum = block_sum(local_sum, scratch);
+        const double lse = block_log_sum_exp(local, scratch);
         if (threadIdx.x == 0)
-            next_u[i] = theta_y * (log_b - maximum - log(sum));
+            next_u[i] = theta_y * (log_b - lse);
         __syncthreads();
     }
 }
@@ -278,28 +321,18 @@ __global__ void update_target_dual_kernel(
     double theta_x, const double* next_u, double* next_v) {
     __shared__ double scratch[kBlockSize];
     for (std::int64_t j = blockIdx.x; j < target_count; j += gridDim.x) {
-        double local_maximum = -CUDART_INF;
+        OnlineLogSumExp local{-CUDART_INF, 0.0};
         for (std::int64_t i = threadIdx.x; i < source_count; i += blockDim.x) {
             const double distance = squared_distance(
                 transformed, source_count, i, target, target_count, j,
                 cost.dimension);
             const double value =
                 log_ba - pair_cost(distance, cost) / eta + next_u[i];
-            local_maximum = fmax(local_maximum, value);
+            local.add(value);
         }
-        const double maximum = block_max(local_maximum, scratch);
-        double local_sum = 0.0;
-        for (std::int64_t i = threadIdx.x; i < source_count; i += blockDim.x) {
-            const double distance = squared_distance(
-                transformed, source_count, i, target, target_count, j,
-                cost.dimension);
-            const double value =
-                log_ba - pair_cost(distance, cost) / eta + next_u[i];
-            local_sum += exp(value - maximum);
-        }
-        const double sum = block_sum(local_sum, scratch);
+        const double lse = block_log_sum_exp(local, scratch);
         if (threadIdx.x == 0)
-            next_v[j] = theta_x * (log_a - maximum - log(sum));
+            next_v[j] = theta_x * (log_a - lse);
         __syncthreads();
     }
 }
@@ -322,7 +355,7 @@ __global__ void source_statistics_kernel(
     const double* target, std::int64_t target_count,
     const double* transformed, std::int64_t source_count,
     DeviceCostModel cost, double log_ba, double eta, const double* log_u,
-    const double* log_v, double* gamma_source_mass,
+    const double* log_v, double* gamma_source_mass, double* log_source_mass,
     double* omega_source_mass, double* omega_sse, double* omega_x2,
     double* cost_terms, double* plan_kl_cores, double* omega_px,
     int* overflow) {
@@ -335,6 +368,7 @@ __global__ void source_statistics_kernel(
         double cost_sum = 0.0;
         double kl_sum = 0.0;
         double px_sum[Dimension > 0 ? Dimension : 1] = {};
+        OnlineLogSumExp row_lse{-CUDART_INF, 0.0};
         for (std::int64_t j = threadIdx.x; j < target_count; j += blockDim.x) {
             const double distance = squared_distance(
                 transformed, source_count, i, target, target_count, j,
@@ -342,6 +376,7 @@ __global__ void source_statistics_kernel(
             const double point_cost = pair_cost(distance, cost);
             const double log_gamma =
                 log_u[i] + log_ba - point_cost / eta + log_v[j];
+            row_lse.add(log_gamma);
             const double gamma = checked_plan_exp(log_gamma, overflow);
             const double omega = gamma * robust_weight(distance, cost);
             double target_x2 = 0.0;
@@ -361,6 +396,8 @@ __global__ void source_statistics_kernel(
                         omega * target[j + target_count * axis];
             }
         }
+        const double log_p = block_log_sum_exp(row_lse, scratch);
+        if (threadIdx.x == 0) log_source_mass[i] = log_p;
         const double gamma_total = block_sum(gamma_sum, scratch);
         if (threadIdx.x == 0) gamma_source_mass[i] = gamma_total;
         const double omega_total = block_sum(omega_sum, scratch);
@@ -443,46 +480,41 @@ __global__ void generic_px_kernel(
     }
 }
 
-__global__ void kkt_partial_kernel(
-    const double* log_u, const double* log_v, const double* mapped_u,
+__global__ void kkt_extrema_kernel(
+    const double* log_u, const double* log_v, const double* log_source_mass,
     std::int64_t source_count,
     std::int64_t target_count, double eta, double tau_y, double tau_x,
-    double theta_y, double theta_x, double log_b, double log_a,
-    std::int64_t pair_count, double* partial) {
+    double theta_x, double log_b, double log_a, double* result) {
     __shared__ double scratch[kBlockSize];
-    double maximum = 0.0;
-    const std::int64_t stride =
-        static_cast<std::int64_t>(blockDim.x) * gridDim.x;
-    for (std::int64_t pair =
-             static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         pair < pair_count; pair += stride) {
-        const std::int64_t i = pair / target_count;
-        const std::int64_t j = pair - i * target_count;
-        // mapped_u is F(log_v).  Therefore log_b-mapped_u/theta_y is
-        // the exact row log-sum-exp for the returned plan.  The final log_v
-        // was produced from the returned log_u, so the analogous target
-        // identity is exact as well.  This keeps KKT diagnostics finite even
-        // when a marginal is below the range of exp(double).
-        const double log_p = log_u[i] + log_b - mapped_u[i] / theta_y;
-        const double log_q = log_v[j] + log_a - log_v[j] / theta_x;
-        const double value = eta * (log_u[i] + log_v[j]) +
-                             tau_y * (log_p - log_b) +
-                             tau_x * (log_q - log_a);
-        maximum = fmax(maximum, fabs(value));
+    double source_minimum = CUDART_INF;
+    double source_maximum = -CUDART_INF;
+    for (std::int64_t i = threadIdx.x; i < source_count; i += blockDim.x) {
+        const double value =
+            eta * log_u[i] + tau_y * (log_source_mass[i] - log_b);
+        source_minimum = fmin(source_minimum, value);
+        source_maximum = fmax(source_maximum, value);
     }
-    maximum = block_max(maximum, scratch);
-    if (threadIdx.x == 0) partial[blockIdx.x] = maximum;
-}
-
-__global__ void maximum_kernel(const double* values, std::int64_t count,
-                               double* result) {
-    __shared__ double scratch[kBlockSize];
-    double maximum = 0.0;
-    for (std::int64_t index = threadIdx.x; index < count;
-         index += blockDim.x)
-        maximum = fmax(maximum, values[index]);
-    maximum = block_max(maximum, scratch);
-    if (threadIdx.x == 0) result[0] = maximum;
+    source_minimum = block_min(source_minimum, scratch);
+    source_maximum = block_max(source_maximum, scratch);
+    double target_minimum = CUDART_INF;
+    double target_maximum = -CUDART_INF;
+    for (std::int64_t j = threadIdx.x; j < target_count; j += blockDim.x) {
+        // The final target dual was produced from the returned source dual.
+        // This identity gives its logarithmic marginal without another LSE;
+        // gamma_target_mass still uses the pairwise exp cutoff independently.
+        const double log_q = log_v[j] + log_a - log_v[j] / theta_x;
+        const double value =
+            eta * log_v[j] + tau_x * (log_q - log_a);
+        target_minimum = fmin(target_minimum, value);
+        target_maximum = fmax(target_maximum, value);
+    }
+    target_minimum = block_min(target_minimum, scratch);
+    target_maximum = block_max(target_maximum, scratch);
+    // Every pair residual is source[i] + target[j].  Its absolute maximum
+    // occurs at one of these two extrema; no point-pair scan is needed.
+    if (threadIdx.x == 0)
+        result[0] = fmax(fabs(source_minimum + target_minimum),
+                         fabs(source_maximum + target_maximum));
 }
 
 __global__ void fixed_cost_kernel(
@@ -582,16 +614,13 @@ TransportOutput sinkhorn_transport_cuda(const Matrix& target,
         checked_product(target_count_index, dimension_index, "target matrix");
     if (source_count > std::numeric_limits<std::int64_t>::max() / target_count)
         throw std::overflow_error("point-pair count is too large");
-    const std::int64_t pair_count = source_count * target_count;
 
     const double log_b = -std::log(static_cast<double>(source_count));
     const double log_a = -std::log(static_cast<double>(target_count));
     const double log_ba = log_b + log_a;
     const double eta = options.transport_entropy;
-    const double theta_y = options.source_mass_penalty /
-                           (options.source_mass_penalty + eta);
-    const double theta_x = options.target_mass_penalty /
-                           (options.target_mass_penalty + eta);
+    const double theta_y = marginal_exponent(options.source_mass_penalty, eta);
+    const double theta_x = marginal_exponent(options.target_mass_penalty, eta);
     const double contraction = theta_y * theta_x;
     const DeviceCostModel cost = make_cost_model(dimension_index, scale, options);
 
@@ -649,33 +678,36 @@ TransportOutput sinkhorn_transport_cuda(const Matrix& target,
     DeviceBuffer<int> overflow(1);
     overflow.zero();
 
+    // The iteration has stopped.  Reuse its inactive source dual buffer for
+    // the logarithmic marginal, preserving finite KKT diagnostics below exp's
+    // representable range without another pairwise cost pass or allocation.
     const int source_grid = grid_size(source_count);
     if (dimension == 1) {
         source_statistics_kernel<1><<<source_grid, kBlockSize>>>(
             device_target.get(), target_count, device_transformed.get(),
             source_count, cost, log_ba, eta, log_u.get(), log_v.get(),
-            gamma_source_mass.get(), omega_source_mass.get(), omega_sse.get(),
+            gamma_source_mass.get(), next_u.get(), omega_source_mass.get(), omega_sse.get(),
             omega_x2.get(), cost_terms.get(), plan_kl_cores.get(),
             omega_px.get(), overflow.get());
     } else if (dimension == 2) {
         source_statistics_kernel<2><<<source_grid, kBlockSize>>>(
             device_target.get(), target_count, device_transformed.get(),
             source_count, cost, log_ba, eta, log_u.get(), log_v.get(),
-            gamma_source_mass.get(), omega_source_mass.get(), omega_sse.get(),
+            gamma_source_mass.get(), next_u.get(), omega_source_mass.get(), omega_sse.get(),
             omega_x2.get(), cost_terms.get(), plan_kl_cores.get(),
             omega_px.get(), overflow.get());
     } else if (dimension == 3) {
         source_statistics_kernel<3><<<source_grid, kBlockSize>>>(
             device_target.get(), target_count, device_transformed.get(),
             source_count, cost, log_ba, eta, log_u.get(), log_v.get(),
-            gamma_source_mass.get(), omega_source_mass.get(), omega_sse.get(),
+            gamma_source_mass.get(), next_u.get(), omega_source_mass.get(), omega_sse.get(),
             omega_x2.get(), cost_terms.get(), plan_kl_cores.get(),
             omega_px.get(), overflow.get());
     } else {
         source_statistics_kernel<0><<<source_grid, kBlockSize>>>(
             device_target.get(), target_count, device_transformed.get(),
             source_count, cost, log_ba, eta, log_u.get(), log_v.get(),
-            gamma_source_mass.get(), omega_source_mass.get(), omega_sse.get(),
+            gamma_source_mass.get(), next_u.get(), omega_source_mass.get(), omega_sse.get(),
             omega_x2.get(), cost_terms.get(), plan_kl_cores.get(), nullptr,
             overflow.get());
     }
@@ -748,24 +780,11 @@ TransportOutput sinkhorn_transport_cuda(const Matrix& target,
         options.source_mass_penalty * output.source_kl +
         options.target_mass_penalty * output.target_kl;
 
-    const std::int64_t rounded_pair_blocks =
-        pair_count / kBlockSize + (pair_count % kBlockSize != 0 ? 1 : 0);
-    const int kkt_blocks = static_cast<int>(std::max<std::int64_t>(
-        1, std::min<std::int64_t>(1024, rounded_pair_blocks)));
-    DeviceBuffer<double> kkt_partial(static_cast<std::size_t>(kkt_blocks));
-    update_source_dual_kernel<<<grid_size(source_count), kBlockSize>>>(
-        device_target.get(), target_count, device_transformed.get(),
-        source_count, cost, log_b, log_ba, eta, theta_y, log_v.get(),
-        next_u.get());
-    check_launch("update_source_dual_kernel (KKT)");
-    kkt_partial_kernel<<<kkt_blocks, kBlockSize>>>(
+    kkt_extrema_kernel<<<1, kBlockSize>>>(
         log_u.get(), log_v.get(), next_u.get(), source_count, target_count,
         eta, options.source_mass_penalty, options.target_mass_penalty,
-        theta_y, theta_x, log_b, log_a, pair_count, kkt_partial.get());
-    check_launch("kkt_partial_kernel");
-    maximum_kernel<<<1, kBlockSize>>>(kkt_partial.get(), kkt_blocks,
-                                      scalar.get());
-    check_launch("maximum_kernel");
+        theta_x, log_b, log_a, scalar.get());
+    check_launch("kkt_extrema_kernel");
     scalar.copy_to_host(&output.kkt_residual, 1);
     return output;
 }
