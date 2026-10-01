@@ -1,0 +1,28 @@
+ClusterReg Sinkhorn performance optimization, measured 2026-10-01.
+
+PR: https://github.com/yuki-inaho/ClusterReg/pull/1
+Publication branch: perf/sinkhorn-native-ipo-20261001 (deleted after merge)
+Source commit: dff8bd2098ba27a502d59848dd36827fa5dab081
+Squash-merged commit: f1a9ea27d70b7e2adcbec802328081908d5dd6cc
+Merged at: 2026-10-01T02:51:09Z
+Merge method: squash; unpublished branch rebase onto origin/main was up to date.
+Base inspected: 4b3942e258a51891687373e90d2ab31bfb3448c3
+
+CPU vectorization/OpenMP/statistic reuse, CUDA LSE/warp reductions, checked
+Native/CPU IPO/CUDA lineinfo options, and correctness-gated profiling.
+
+Same-input CPU median Student-t fit times (i7-9750H, d3/r64/t4,
+3 outer iterations, 50 inner sweeps, 3 interleaved repeats):
+1024 source points: 5.966512 -> 1.663604 seconds (3.586x).
+2048 source points: 22.884346 -> 6.529018 seconds (3.505x).
+All 72 comparison runs pass numerical/workload/final-E gates.
+
+Python: 43 passed, 3 CUDA-unavailable skips. C++ 23 cases and independent
+official/paper oracles pass. Serial/OpenMP ASan+UBSan pass with leak detection
+disabled. CUDA builds pass; updated GPU runtime, leak/race detection, and
+packet/scalar seam-specific tests are unverified.
+
+See docs/PERFORMANCE_JA.md for methodology and limitations.
+Attached to the verified squash-merged commit. Its tree exactly matches the
+reviewed source commit. No remote CI workflows/checks were configured; local
+quality gates passed. No force-push or admin bypass was used.
