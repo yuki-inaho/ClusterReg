@@ -334,8 +334,9 @@ Update dense_update(const Matrix& y,const Matrix& kernel,const Statistics& s,dou
     a.diagonal().array()+=kappa;
     Matrix rhs=s.px-(y.array().colwise()*s.mass.array()).matrix();
     Update out; out.coefficients=a.partialPivLu().solve(rhs);
-    out.transformed=y+kernel*out.coefficients;
-    out.penalty=(out.coefficients.array()*(kernel*out.coefficients).array()).sum();
+    const Matrix displacement=kernel*out.coefficients;
+    out.transformed=y+displacement;
+    out.penalty=(out.coefficients.array()*displacement.array()).sum();
     out.residual=(a*out.coefficients-rhs).norm()/std::max(1e-30,rhs.norm());
     if(!out.transformed.allFinite()) throw std::runtime_error("Nonfinite dense solution");
     return out;

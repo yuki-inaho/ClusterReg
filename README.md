@@ -27,6 +27,19 @@ pixi run test
 
 テストを走らせず対話的に Python API だけ準備する場合は `pixi run install-python` を使います。
 
+このマシン専用のビルド最適化も選べます（既定は可搬のまま）。
+
+```bash
+pixi run test-native                   # -march=native、C++検証
+pixi run test-fast                     # Native + LTO、C++/Python/理論検証
+pixi run profile-sinkhorn-student-fast # 生時間・数値ゲート付きプロファイル
+pixi run -e cuda build-cuda-fast        # Native host + CUDA lineinfo、LTOなし
+```
+
+`CLUSTERREG_NATIVE` / `CLUSTERREG_IPO` / `CLUSTERREG_CUDA_LINEINFO` は明示的な
+CMake 選択肢です。Native は他 CPU への配布に不向き、IPO は CPU-only のみ対応します。
+fast-math は使いません。Python fast/通常インストールは同じ環境の拡張を置き換えます。
+
 `pixi run test` は次を end-to-end で実行します。
 
 - C++ の数式・境界条件テスト
@@ -168,6 +181,7 @@ Gaussian/Student-t 密度の正規化項も保持します。Sinkhorn モード�
 - [論文・公式実装との差分監査](docs/AUDIT_JA.md)
 - [実測結果と再現範囲](docs/RESULTS_JA.md)
 - [UOT-CluReg の目的関数・API・CUDA・診断仕様](docs/SINKHORN_IMPLEMENTATION_JA.md)
+- [行列/SIMD設計・ビルド最適化・旧版との同条件性能比較](docs/PERFORMANCE_JA.md)
 
 ## 高速化
 
@@ -178,6 +192,12 @@ Gaussian/Student-t 密度の正規化項も保持します。Sinkhorn モード�
 - 極小確率でも壊れない log-sum-exp と scalar tail `exp`
 - UOT の `M×N` 計画を保存せず、対数 Sinkhorn と十分統計を全点対から逐次縮約
 - 任意の CUDA バックエンドで点対コスト、LSE、統計量、KKT 残差を float64 計算
+
+2026-10-01 の i7-9750H 同一入力比較（3回中央値、threads4、rank64、外側3・内側50）
+では、1024点 Student-t が旧版 `5.9665 s` → Native+LTO `1.6636 s`（`3.59x`）、
+2048点は `22.8843 s` → `6.5290 s`（`3.51x`）でした。数値・実反復・最終 E-step
+を照合しています。LTOやスレッド増加は常に最速ではありません。
+設定・生値・制限は [性能記録](docs/PERFORMANCE_JA.md) を参照してください。
 
 近傍打切り、ハード対応、輸送疎化、Gaussian 変形 kernel への置換は行っていません。
 clustering E-step と Sinkhorn 輸送はいずれも全点対を評価するため、点対部分の時間計算量
@@ -208,6 +228,9 @@ CUDA CLI は `pixi run -e cuda build-cuda` で `build/pixi-cuda-env/clusterreg_c
 生成されます。Pixi タスクは既定で compute capability 7.5 を対象にします。
 `--backend auto` は CUDA 対応ビルドかつデバイス利用可能時だけ CUDA を選択し、
 実際の選択を `metrics.json` の `backend` に記録します。
+
+以下は今回の最適化前の歴史的な GPU 記録です。変更後 CUDA はビルド/静的監査のみで、
+2026-10-01 は driver 不可用のため実機速度・parity を再検証していません。
 
 RTX 2070、3次元、rank 64、1024対1025点、外側3・内側50反復の単一プロファイルでは、
 中央値が CPU `2.6685 s`、CUDA `0.3707 s`（約 `7.20x`）、変形の相対差は
